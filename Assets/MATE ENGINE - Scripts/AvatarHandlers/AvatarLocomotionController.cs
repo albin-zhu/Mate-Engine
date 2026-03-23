@@ -127,6 +127,17 @@ public sealed class AvatarLocomotionController : MonoBehaviour
 
     bool _wasBaseIdle;
 
+    // --- Public Walk APIs ---
+    [Header("Targeted Walk")]
+    [Tooltip("Target X position for WalkToPosition (screen coordinates)")]
+    public int TargetWalkX = -1; // -1 means no target
+
+    [Tooltip("If true, ignores avatar bounds blocking (for 'get lost' off-screen movement)")]
+    public bool IgnoreBoundsBlocking = false;
+
+    /// <summary>True if currently walking (auto or targeted)</summary>
+    public bool IsWalking => _walking;
+
     static readonly Vector3[] _boundsCorners = new Vector3[8];
 
     void OnEnable()
@@ -285,6 +296,110 @@ public sealed class AvatarLocomotionController : MonoBehaviour
         Animator = a;
         RefreshLayerIndex();
     }
+
+    // ========== Public Walk APIs ==========
+
+    /// <summary>
+    /// Walk to a specific screen X coordinate. Stops automatic locomotion while walking to target.
+    /// </summary>
+    /// <param name="targetX">Screen X coordinate to walk to</param>
+    public void WalkToPosition(int targetX)
+    {
+        if (_hwnd == IntPtr.Zero) CacheWindowHandle();
+        if (_hwnd == IntPtr.Zero) return;
+        if (!GetWindowRect(_hwnd, out RECT r)) return;
+
+        int currentX = r.Left;
+        int delta = targetX - currentX;
+
+        if (Mathf.Abs(delta) < 5)
+        {
+            StopWalking();
+            return;
+        }
+
+        // Cancel any existing targeted walk
+        CancelTargetedWalk();
+
+        // Set up targeted walk
+        TargetWalkX = targetX;
+        _dir = delta > 0 ? 1 : -1;
+        _remainingPixels = Mathf.Abs(delta);
+        _walking = true;
+
+        Animator?.SetBool(WalkLeftParam, _dir < 0);
+        Animator?.SetBool(WalkRightParam, _dir > 0);
+    }
+
+    /// <summary>
+    /// 走开 - Walk to the nearest screen edge.
+    /// </summary>
+    public void GoAway()
+    {
+        if (_hwnd == IntPtr.Zero) CacheWindowHandle();
+        if (_hwnd == IntPtr.Zero) return;
+        if (!TryGetMonitorBounds(_hwnd, out int monitorLeft, out int monitorRight))
+        {
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            monitorLeft = vx;
+            monitorRight = vx + vw;
+        }
+        if (!GetWindowRect(_hwnd, out RECT r)) return;
+
+        int currentCenter = (r.Left + r.Right) / 2;
+        int monitorCenter = (monitorLeft + monitorRight) / 2;
+
+        // Walk to nearest edge
+        int targetX = currentCenter < monitorCenter ? monitorLeft : monitorRight - (r.Right - r.Left);
+        WalkToPosition(targetX);
+    }
+
+    /// <summary>
+    /// 滚 - Walk off-screen (get lost). Moves past the screen edge.
+    /// </summary>
+    /// <param name="keepOffscreen">If true, stays off-screen after walking off</param>
+    public void GetLost(bool keepOffscreen = true)
+    {
+        if (_hwnd == IntPtr.Zero) CacheWindowHandle();
+        if (_hwnd == IntPtr.Zero) return;
+        if (!TryGetMonitorBounds(_hwnd, out int monitorLeft, out int monitorRight))
+        {
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            monitorLeft = vx;
+            monitorRight = vx + vw;
+        }
+        if (!GetWindowRect(_hwnd, out RECT r)) return;
+
+        int windowWidth = r.Right - r.Left;
+        int currentCenter = (r.Left + r.Right) / 2;
+        int monitorCenter = (monitorLeft + monitorRight) / 2;
+
+        // Determine which edge to go off
+        bool goLeft = currentCenter < monitorCenter;
+
+        // Target is off-screen: past the edge by ~30% of window width
+        int targetX = goLeft
+            ? monitorLeft - Mathf.RoundToInt(windowWidth * 0.7f)
+            : monitorRight - Mathf.RoundToInt(windowWidth * 0.3f);
+
+        // Enable bounds bypass for off-screen movement
+        IgnoreBoundsBlocking = true;
+        WalkToPosition(targetX);
+    }
+
+    /// <summary>
+    /// Cancel any in-progress targeted walk and resume automatic locomotion.
+    /// </summary>
+    public void CancelTargetedWalk()
+    {
+        TargetWalkX = -1;
+        IgnoreBoundsBlocking = false;
+        StopWalking();
+    }
+
+    // ========== End Public Walk APIs ==========
 
     void ResolveAnimatorSmart(bool immediate)
     {
@@ -462,7 +577,16 @@ public sealed class AvatarLocomotionController : MonoBehaviour
         int minX;
         int maxX;
 
-        if (UseAvatarBoundsBlocking && TryGetBlockingInfo(out BlockingInfo bi))
+        // For off-screen movement (GetLost), bypass bounds blocking
+        if (IgnoreBoundsBlocking)
+        {
+            // Allow movement anywhere on the virtual screen
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            minX = vx - w;  // Can go off left by one window width
+            maxX = vx + vw; // Can go off right by one window width
+        }
+        else if (UseAvatarBoundsBlocking && TryGetBlockingInfo(out BlockingInfo bi))
         {
             minX = bi.minWindowX;
             maxX = bi.maxWindowX;
@@ -508,7 +632,20 @@ public sealed class AvatarLocomotionController : MonoBehaviour
         }
 
         if (_remainingPixels <= 0.01f)
+        {
             EndWalk();
+            return;
+        }
+
+        // For targeted walk: check if we reached or passed the target
+        if (TargetWalkX >= 0)
+        {
+            bool reached = (_dir > 0 && clampedX >= TargetWalkX) || (_dir < 0 && clampedX <= TargetWalkX);
+            if (reached)
+            {
+                EndWalk();
+            }
+        }
     }
 
     void EndWalk()
